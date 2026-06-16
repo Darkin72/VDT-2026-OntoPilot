@@ -9,10 +9,15 @@ services:
     environment:
       GRAPHDB_URL: http://graphdb:7200
       FRONTEND_ORIGIN: http://localhost:5200
+      QDRANT_URL: http://qdrant:6333
+      ONTOLOGY_SCHEMA_PATH: /app/Ontology/ontology--DEV_type=parsed_sorted.nt
+    volumes:
+      - ../Ontology:/app/Ontology:ro
     ports:
       - "8090:8000"
     depends_on:
       - graphdb
+      - qdrant
     restart: unless-stopped
 
   frontend:
@@ -35,5 +40,14 @@ services:
       - ../Ontology:/opt/graphdb/home/graphdb-import:ro
     restart: unless-stopped
 
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6363:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+
 volumes:
   graphdb-data:
+  qdrant-data:

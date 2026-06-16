@@ -1,7 +1,7 @@
-import json
 from typing import Any
 
 from app import graphdb_service, llm_service, logging_service
+from app.agents.central.agent import history_to_text
 
 
 def final_answer_messages(message: str, history: dict[str, Any]) -> list[llm_service.ChatMessage]:
@@ -16,11 +16,14 @@ def final_answer_messages(message: str, history: dict[str, Any]) -> list[llm_ser
             "If GraphDB rows are available in history, compare those facts with the original choices and choose only the option supported by GraphDB evidence. "
             "Every evidence item should cite a concrete value, entity, relationship, date, count, or literal from the history when possible. "
             "If no usable SPARQL evidence exists after the central agent stopped, choose the most likely answer from general knowledge and say evidence is a best-effort fallback. "
-            "For non-multiple-choice prompts, answer clearly and include GraphDB evidence when available."
+            "For non-multiple-choice prompts, answer clearly and include GraphDB evidence when available. "
+            "For Vietnamese count questions such as 'bao nhiêu', 'mấy', or 'số lượng', count distinct concrete entities or literal values from the latest non-empty GraphDB rows when the rows contain plausible answer candidates. "
+            "Do not refuse to answer a count only because the exact relationship label is imperfect; instead answer the count and qualify it when needed, for example 'GraphDB tìm thấy N thực thể liên quan, nhưng quan hệ cụ thể không được chuẩn hóa'. "
+            "Central-agent next_action reasons are routing notes, not final evidence; prefer the concrete SPARQL rows over a pessimistic routing reason."
         ),
         llm_service.user_message(
             f"Original prompt including any answer choices:\n{message}\n\n"
-            f"Execution history:\n{json.dumps(history, ensure_ascii=False, indent=2)}\n\n"
+            f"Execution history:\n{history_to_text(history)}\n\n"
             "Return the final answer to the user."
         ),
     ]

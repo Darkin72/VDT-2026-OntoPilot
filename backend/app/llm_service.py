@@ -63,6 +63,19 @@ def build_browser_headers() -> dict[str, str]:
 
     return headers
 
+def stream_enabled() -> bool:
+    return os.getenv("CHAT_API_STREAM", "true").strip().lower() in {"1", "true", "yes"}
+
+def safe_payload_for_log(payload: dict) -> dict:
+    messages = payload.get("messages") or []
+    return {
+        **{key: value for key, value in payload.items() if key != "messages"},
+        "message_count": len(messages) if isinstance(messages, list) else None,
+        "message_chars": sum(len(str(message.get("content", ""))) for message in messages)
+        if isinstance(messages, list)
+        else None,
+    }
+
 
 def build_payload(messages: list[ChatMessage], *, stream: bool = True) -> dict:
     return {
@@ -135,24 +148,33 @@ def is_retryable_llm_error(exc: requests.RequestException) -> bool:
 def stream_messages(messages: list[ChatMessage]) -> Iterator[str]:
     attempts = max_retries() + 1
     yielded_any = False
+    api_url = build_api_url()
+    request_payload = build_payload(messages, stream=stream_enabled())
     for attempt in range(1, attempts + 1):
         try:
             with requests.post(
-                build_api_url(),
+                api_url,
                 headers=build_browser_headers(),
-                json=build_payload(messages, stream=True),
-                stream=True,
+                json=request_payload,
+                stream=stream_enabled(),
                 timeout=(connect_timeout_seconds(), read_timeout_seconds()),
             ) as response:
                 response.raise_for_status()
-                for raw_line in response.iter_lines(decode_unicode=True):
-                    chunk = parse_stream_line(raw_line or "")
+                if stream_enabled():
+                    for raw_line in response.iter_lines(decode_unicode=True):
+                        chunk = parse_stream_line(raw_line or "")
+                        if chunk:
+                            yielded_any = True
+                            yield chunk
+                else:
+                    chunk = parse_stream_line(response.text)
                     if chunk:
                         yielded_any = True
                         yield chunk
                 return
         except requests.RequestException as exc:
             should_retry = attempt < attempts and not yielded_any and is_retryable_llm_error(exc)
+            response = getattr(exc, "response", None)
             logging_service.agent_step(
                 "llm.request_error",
                 {
@@ -161,6 +183,10 @@ def stream_messages(messages: list[ChatMessage]) -> Iterator[str]:
                     "retry": should_retry,
                     "type": type(exc).__name__,
                     "message": str(exc),
+                    "url": api_url,
+                    "status_code": response.status_code if response is not None else None,
+                    "response_text": response.text if response is not None else None,
+                    "payload": safe_payload_for_log(request_payload),
                 },
                 limit=3000,
             )

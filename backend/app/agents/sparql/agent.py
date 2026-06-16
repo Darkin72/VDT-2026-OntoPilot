@@ -1,8 +1,11 @@
 import re
+import unicodedata
 from typing import Any
 
 from app import llm_service, logging_service
 from app.agents.central import extract_json_object
+from app.agents.central.agent import strip_answer_options
+from app.rag import ontology_retriever
 
 READ_ONLY_SPARQL_PATTERN = re.compile(
     r"\b(INSERT|DELETE|LOAD|CLEAR|CREATE|DROP|MOVE|COPY|ADD|SERVICE)\b",
@@ -56,6 +59,8 @@ COMMON_PREFIXES = {
 
 PREFIX_DECLARATION_PATTERN = re.compile(r"(?im)^\s*PREFIX\s+([A-Za-z][\w-]*):")
 PREFIX_USAGE_PATTERN = re.compile(r"(?<![\w:/#])([A-Za-z][\w-]*):[A-Za-z_][\w.-]*")
+WORD_PATTERN = re.compile(r"[\wÀ-ỹĐđ.-]+", re.UNICODE)
+STOP_RESOURCE_PHRASES = {"GraphDB", "DBpedia", "SPARQL", "JSON"}
 
 
 def add_missing_common_prefixes(query: str) -> str:
@@ -81,14 +86,84 @@ def is_read_only_sparql(query: str) -> bool:
     return without_prefixes.upper().startswith(("SELECT", "ASK"))
 
 
+def strip_diacritics(text: str) -> str:
+    normalized = unicodedata.normalize("NFD", text)
+    stripped = "".join(character for character in normalized if unicodedata.category(character) != "Mn")
+    return stripped.replace("Đ", "D").replace("đ", "d")
+
+
+def resource_iri_name(text: str) -> str:
+    return re.sub(r"\s+", "_", text.strip())
+
+
+def possible_resource_names(user_prompt: str, query_description: str) -> list[str]:
+    text = f"{query_description}\n{strip_answer_options(user_prompt)}"
+    names: list[str] = []
+    for segment in re.split(r"[\n\r\t,;:!?()\[\]{}]+", text):
+        words = WORD_PATTERN.findall(segment)
+        index = 0
+        while index < len(words):
+            word = words[index]
+            if not word[:1].isupper():
+                index += 1
+                continue
+
+            phrase_words = [word]
+            cursor = index + 1
+            while cursor < len(words) and len(phrase_words) < 6 and words[cursor][:1].isupper():
+                phrase_words.append(words[cursor])
+                cursor += 1
+
+            index = cursor
+            if len(phrase_words) < 2:
+                continue
+
+            name = " ".join(phrase_words).strip(" .,:;!?()[]{}\"'")
+            if not name or name in STOP_RESOURCE_PHRASES:
+                continue
+            if name not in names:
+                names.append(name)
+
+            ascii_name = strip_diacritics(name)
+            if ascii_name != name and ascii_name not in names:
+                names.append(ascii_name)
+    return names[:8]
+
+
+def possible_resource_block(user_prompt: str, query_description: str) -> str:
+    names = possible_resource_names(user_prompt, query_description)
+    if not names:
+        return ""
+
+    lines = ["Possible DBpedia resource IRIs from the question:"]
+    lines.extend(f"- dbr:{resource_iri_name(name)}" for name in names)
+    return "\n".join(lines)
+
+
 def generate_sparql(user_prompt: str, query_description: str) -> str:
+    ontology_candidates_block = ontology_retriever.format_candidates_block(query_description)
+    resource_candidates_block = possible_resource_block(user_prompt, query_description)
+    ontology_candidates_prompt = (
+        f"{ontology_candidates_block}\n\n"
+        "Use these ontology URI candidates as schema hints only. "
+        "They are not guaranteed to be populated predicates in the local graph. "
+        "If predicate confidence is low, prefer a broad predicate scan from the correct subject instead of forcing a narrow candidate.\n\n"
+        if ontology_candidates_block
+        else ""
+    )
+    resource_candidates_prompt = f"{resource_candidates_block}\n\n" if resource_candidates_block else ""
     prompt = (
         "You are a SPARQL coder for the local GraphDB.\n"
         "Create one read-only SPARQL query from the central agent description.\n"
         "Only create SELECT or ASK. Do not use INSERT, DELETE, UPDATE, or SERVICE.\n"
+        "Main priority for this phase: identify the correct subject and object resources. Predicate choice may be imperfect.\n"
         "Prefer returning neutral factual evidence: entities, relationships, labels, dates, counts, and literal values needed by the core question.\n"
-        "When selecting resources, include rdfs:label values when available and prefer FILTER(lang(?label) = 'en').\n"
-        "For entity lookup, use exact dbr:Entity_Name only when confident; otherwise search labels with CONTAINS(LCASE(STR(?label)), \"text\").\n"
+        "For entity lookup, prefer exact dbr:Entity_Name candidates from the question before label search. Preserve Vietnamese diacritics in dbr: IRIs and also try ASCII-folded alternatives when provided.\n"
+        "If exact resources are plausible, use VALUES for them and then query their predicates directly; do not make rdfs:label matching the only way to find the entity.\n"
+        "When selecting resources, include labels/names when available using OPTIONAL rdfs:label or foaf:name. Do not require labels to exist.\n"
+        "When the correct predicate is uncertain, use a broad pattern like ?subject ?predicate ?object with OPTIONAL predicate/object labels, and return enough rows for the central/answer agents to choose or count distinct objects.\n"
+        "For count questions, return candidate objects/resources and labels; do not over-filter with a hand-picked predicate list unless the predicate is highly certain.\n"
+        "For fallback lookup, search across rdfs:label, foaf:name, and dbo:alias, and avoid strict language filters unless the variable is optional evidence only.\n"
         "Do not include answer choices, option IDs, VALUES blocks for choices, or BINDs mapping choices to options. The central agent handles choices later.\n"
         "SPARQL function syntax matters: use CONTAINS(LCASE(STR(?label)), \"text\"), never LCASE(STR(?label)) CONTAINS(\"text\").\n\n"
         "Common prefixes:\n"
@@ -99,6 +174,8 @@ def generate_sparql(user_prompt: str, query_description: str) -> str:
         "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n"
         "PREFIX foaf: <http://xmlns.com/foaf/0.1/>\n"
         "PREFIX owl: <http://www.w3.org/2002/07/owl#>\n\n"
+        f"{resource_candidates_prompt}"
+        f"{ontology_candidates_prompt}"
         f"Schema hints:\n{ONTOLOGY_HINTS}\n\n"
         "Return only valid JSON with this schema: {\"sparql\":\"...\"}.\n"
         "If a useful query cannot be created, return {\"sparql\":\"\"}.\n\n"
@@ -120,3 +197,4 @@ def generate_sparql(user_prompt: str, query_description: str) -> str:
         return ""
     logging_service.agent_text("sparql_agent.final_sparql", sparql)
     return sparql
+

@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from typing import Any
 
@@ -51,8 +52,64 @@ def add_history_step(history: dict[str, Any], step_type: str, payload: dict[str,
     if isinstance(steps, list):
         steps.append({"type": step_type, **payload})
 
+def max_history_chars() -> int:
+    return max(1000, int(os.getenv("LLM_HISTORY_MAX_CHARS", "50000")))
+
+def max_history_field_chars() -> int:
+    return max(500, int(os.getenv("LLM_HISTORY_FIELD_MAX_CHARS", "8000")))
+
+def shorten_for_history(value: Any) -> Any:
+    if isinstance(value, str):
+        limit = max_history_field_chars()
+        return value if len(value) <= limit else f"{value[:limit]}...<truncated {len(value) - limit} chars>"
+    if isinstance(value, list):
+        return [shorten_for_history(item) for item in value]
+    if isinstance(value, dict):
+        return {key: shorten_for_history(item) for key, item in value.items()}
+    return value
+
+def compact_graphdb_result(result: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {"summary": graphdb_service.summarize_result(result)}
+    try:
+        compact["sample"] = json.loads(graphdb_service.format_result(result))
+    except (TypeError, json.JSONDecodeError, ValueError):
+        compact["sample"] = graphdb_service.format_result(result)
+    return compact
+
+def compact_history_for_llm(history: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {"original_prompt": shorten_for_history(history.get("original_prompt", ""))}
+    steps = history.get("steps", [])
+    compact_steps: list[dict[str, Any]] = []
+    if isinstance(steps, list):
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            compact_step: dict[str, Any] = {}
+            for key, value in step.items():
+                if key == "result" and isinstance(value, dict):
+                    compact_step["result"] = compact_graphdb_result(value)
+                else:
+                    compact_step[key] = shorten_for_history(value)
+            compact_steps.append(compact_step)
+    compact["steps"] = compact_steps
+    return compact
+
 def history_to_text(history: dict[str, Any]) -> str:
-    return json.dumps(history, ensure_ascii=False, indent=2)
+    compact = compact_history_for_llm(history)
+    text = json.dumps(compact, ensure_ascii=False, indent=2)
+    limit = max_history_chars()
+    if len(text) <= limit:
+        return text
+
+    steps = compact.get("steps", [])
+    if isinstance(steps, list) and len(steps) > 6:
+        compact["omitted_older_steps"] = len(steps) - 6
+        compact["steps"] = steps[-6:]
+        text = json.dumps(compact, ensure_ascii=False, indent=2)
+        if len(text) <= limit:
+            return text
+
+    return f"{text[:limit]}...<truncated {len(text) - limit} chars>"
 
 def decide_next_action(
     message: str,
@@ -75,6 +132,8 @@ def decide_next_action(
         "Decide whether the available information is enough to answer, or whether one more neutral GraphDB lookup is needed.\n\n"
         "Important rules:\n"
         "- If history contains enough concrete evidence or enough failed attempts to make progress unlikely, choose action=answer.\n"
+        "- For count questions ('bao nhiêu', 'mấy', 'số lượng'), if a broad lookup returns distinct concrete candidate entities or values, choose action=answer and let the answer formatter count them, even when exact relationship labels are not perfectly normalized.\n"
+        "- Do not mark evidence unusable solely because a relationship predicate is broad or non-standard; note that the final answer can qualify the count.\n"
         "- If one more lookup is useful, choose action=sparql and write a neutral query_description for the SPARQL coder.\n"
         "- Do not include answer option IDs or answer choices in query_description.\n"
         "- Avoid repeating failed or already-executed lookups from history.\n"
