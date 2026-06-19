@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RESULTS_DIR = REPO_ROOT / "bench" / "results" / "gen_sparql+self_correction+rag_v2"
+DEFAULT_RESULTS_DIR = REPO_ROOT / "bench" / "results" / "planning"
 
 QUESTION_TYPES = [
     "comparison",
@@ -84,16 +84,17 @@ def load_report(summary_path: Path) -> ReportMetrics:
         summary = json.load(handle)
 
     total_time, avg_time = read_latency(csv_path)
+    metrics = summary.get("summary", summary)
     by_type = {
-        question_type: float(summary.get("by_type", {}).get(question_type, {}).get("correct", 0.0))
+        question_type: float(metrics.get("by_type", {}).get(question_type, {}).get("correct", 0.0))
         for question_type in QUESTION_TYPES
     }
 
     return ReportMetrics(
-        accuracy=float(summary.get("accuracy", 0.0)),
-        pass_count=float(summary.get("correct", 0.0)),
+        accuracy=float(metrics.get("accuracy", 0.0)),
+        pass_count=float(metrics.get("correct", 0.0)),
         by_type=by_type,
-        evidence_count=float(summary.get("db_evidence_count", 0.0)),
+        evidence_count=float(metrics.get("db_evidence_count", 0.0)),
         total_time=total_time,
         avg_time=avg_time,
     )
@@ -143,7 +144,7 @@ def write_csv(csv_out: Path, values: dict[str, float]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Average 5 benchmark summary reports.")
+    parser = argparse.ArgumentParser(description="Average benchmark summary reports.")
     parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
     parser.add_argument("--csv-out", type=Path, help="Optional output CSV path.")
     return parser.parse_args()

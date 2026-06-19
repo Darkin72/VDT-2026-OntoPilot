@@ -1,5 +1,13 @@
 name: vdt
 services:
+  graphdb:
+    image: ontotext/graphdb:10.8.8
+    ports:
+      - "7200:7200"
+    volumes:
+      - graphdb-data:/opt/graphdb/home
+    restart: unless-stopped
+
   backend:
     build:
       context: ../backend
@@ -7,7 +15,7 @@ services:
       - path: ../backend/.env
         required: false
     environment:
-      GRAPHDB_URL: http://157.10.53.238:21150
+      GRAPHDB_URL: http://graphdb:7200
       GRAPHDB_REPOSITORY: DBPEDIA
       FRONTEND_ORIGIN: http://localhost:5200
       ONTOLOGY_SCHEMA_PATH: /app/Ontology/ontology--DEV_type=parsed_sorted.nt
@@ -18,7 +26,6 @@ services:
     ports:
       - "8090:8000"
     restart: unless-stopped
-
   ontology-lookup:
     build:
       context: ../backend
@@ -29,7 +36,15 @@ services:
       - ../Ontology:/app/Ontology:ro
     ports:
       - "8091:8001"
-    command: ["uvicorn", "app.lookup_service:app", "--host", "0.0.0.0", "--port", "8001"]
+    command:
+      [
+        "uvicorn",
+        "app.lookup_service:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8001",
+      ]
     restart: unless-stopped
 
   frontend:
@@ -42,3 +57,6 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+
+volumes:
+  graphdb-data:

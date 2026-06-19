@@ -26,7 +26,7 @@ app.add_middleware(
 def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "graphdb_url": os.getenv("GRAPHDB_URL", "http://157.10.53.238:21150"),
+        "graphdb_url": os.getenv("GRAPHDB_URL", "http://graphdb:7200"),
         "graphdb_repository_url": graphdb_service.build_repository_url(),
         "chat_api_base_url": os.getenv("CHAT_API_BASE_URL", "not-configured"),
     }

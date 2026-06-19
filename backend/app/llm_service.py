@@ -195,5 +195,9 @@ def stream_messages(messages: list[ChatMessage]) -> Iterator[str]:
             time.sleep(retry_backoff_seconds())
 
 
+
+def sanitize_model_text(text: str) -> str:
+    return text.strip()
+
 def complete_text(messages: list[ChatMessage]) -> str:
     return "".join(stream_messages(messages)).strip()

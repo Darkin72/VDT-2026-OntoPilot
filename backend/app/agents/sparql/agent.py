@@ -44,8 +44,9 @@ Local GraphDB schema hints from Ontology/ontology--DEV_type=parsed_sorted.nt:
   <http://dbpedia.org/ontology/Lake/volume>.
 - Datatype units use http://dbpedia.org/datatype/, for example metre, kilometre, kilogram, kelvin,
   squareKilometre, inhabitantsPerSquareKilometre.
-- If an exact property is uncertain, first prefer broad predicate discovery queries using rdfs:label filters
-  and return candidate ?p ?pLabel ?value. Do not invent properties outside dbo:, dbp:, rdf:, rdfs:, foaf:.
+- If an exact property is uncertain, first prefer anchored predicate discovery using a known subject,
+  a constrained rdf:type class, a VALUES ?p candidate list, or schema-only property typing.
+  Return candidate ?p ?pLabel ?value only from anchored patterns. Do not invent properties outside dbo:, dbp:, rdf:, rdfs:, foaf:.
 """.strip()
 
 COMMON_PREFIXES = {
@@ -64,6 +65,10 @@ PREFIX_LINE_PATTERN = re.compile(r"(?im)^\s*PREFIX\s+[^\n]+\n?")
 LEADING_VALUES_PATTERN = re.compile(r"(?is)^\s*((?:VALUES\s+\?\w+\s*\{[^{}]*\}\s*)+)((?:SELECT|ASK)\b.*)$")
 WORD_PATTERN = re.compile(r"[^\W\d_][\w.-]*", re.UNICODE)
 STOP_RESOURCE_PHRASES = {"GraphDB", "DBpedia", "SPARQL", "JSON"}
+OPERATIONAL_LOOKUP_TERM_PATTERN = re.compile(
+    r"(?is)\b(sparql|query|count|count\s*distinct|total\s+number|single\s+integer|"
+    r"aggregate|perform|execute|return|select|ask|where|limit|evidence)\b"
+)
 
 
 def add_missing_common_prefixes(query: str) -> str:
@@ -105,14 +110,15 @@ def normalize_filter_logical_or(query: str) -> str:
 def normalize_escaped_sparql_whitespace(query: str) -> str:
     return query.replace(r"\n", "\n").replace(r"\t", "\t")
 
-def ensure_select_limit(query: str, *, default_limit: int = 100) -> str:
+def ensure_select_limit(query: str, *, default_limit: int = 200) -> str:
     body = PREFIX_LINE_PATTERN.sub("", query).strip()
     if not body.upper().startswith("SELECT"):
+        return query
+    if re.search(r"(?is)\bCOUNT\s*\(", body):
         return query
     if re.search(r"(?is)\bLIMIT\s+\d+\s*$", query):
         return query
     return f"{query.rstrip()}\nLIMIT {default_limit}"
-
 
 def is_read_only_sparql(query: str) -> bool:
     if not query or READ_ONLY_SPARQL_PATTERN.search(query):
@@ -124,7 +130,7 @@ def is_read_only_sparql(query: str) -> bool:
 def strip_diacritics(text: str) -> str:
     normalized = unicodedata.normalize("NFD", text)
     stripped = "".join(character for character in normalized if unicodedata.category(character) != "Mn")
-    return stripped.replace("Ã„Â", "D").replace("Ã„â€˜", "d")
+    return stripped.replace("\u0110", "D").replace("\u0111", "d")
 
 
 def resource_iri_name(text: str) -> str:
@@ -174,11 +180,91 @@ def possible_resource_block(user_prompt: str, query_description: str) -> str:
     lines.extend(f"- dbr:{resource_iri_name(name)}" for name in names)
     return "\n".join(lines)
 
+def generate_ontology_lookup_terms(
+    user_prompt: str,
+    query_description: str,
+    *,
+    subquery_id: str | None = None,
+    round_context: dict[str, Any] | None = None,
+) -> list[str]:
+    subquery = round_context.get("subquery") if isinstance(round_context, dict) else None
+    purpose = str(subquery.get("purpose", "")) if isinstance(subquery, dict) else ""
+    expected_evidence = str(subquery.get("expected_evidence", "")) if isinstance(subquery, dict) else ""
+    prompt = (
+        "Create ontology lookup terms for a DBpedia/GraphDB SPARQL coder.\n"
+        "Return only terms that could be ontology classes, properties, resource labels, aliases, or domain concepts.\n"
+        "Do not include operational/query-planning words such as SPARQL, query, COUNT, COUNT DISTINCT, total number, single integer, aggregate, perform, execute, return, SELECT, WHERE, LIMIT, or evidence.\n"
+        "Prefer short terms, CURIEs, or labels, for example: scientist, researcher, scholar, occupation, field, dbo:Scientist, dbo:occupation, dbp:occupation.\n"
+        "Return only valid JSON with this schema: {\"terms\":[\"...\"]}. Use 3 to 8 terms.\n\n"
+        f"Original user prompt:\n{user_prompt}\n\n"
+        f"Subquery id: {subquery_id or ''}\n"
+        f"Central subquery description:\n{query_description}\n\n"
+        f"Purpose:\n{purpose}\n\n"
+        f"Expected evidence:\n{expected_evidence}"
+    )
+    raw_text = llm_service.complete_text(
+        [
+            llm_service.system_message("You choose ontology lookup terms. Return only lookup-term JSON."),
+            llm_service.user_message(prompt),
+        ]
+    )
+    logging_service.verbose_text("sparql_agent.raw_ontology_lookup_terms", raw_text)
+    data = extract_json_object(raw_text)
+    raw_terms = data.get("terms") if isinstance(data, dict) else None
+    if not isinstance(raw_terms, list):
+        return []
+
+    terms: list[str] = []
+    seen_terms: set[str] = set()
+    for raw_term in raw_terms:
+        term = str(raw_term).strip(" \t\r\n.,;!?()[]{}<>`~|/@#$%^&*+=\\\"")
+        if not term or OPERATIONAL_LOOKUP_TERM_PATTERN.search(term):
+            continue
+        normalized = term.casefold()
+        if normalized in seen_terms:
+            continue
+        seen_terms.add(normalized)
+        terms.append(term)
+        if len(terms) >= 8:
+            break
+
+    logging_service.agent_step("sparql_agent.ontology_lookup_terms", {"terms": terms}, limit=2000)
+    return terms
+
 
 
 def previous_attempts_block(history: dict[str, Any] | None) -> str:
     if not history:
         return ""
+
+    rounds = history.get("rounds", [])
+    if isinstance(rounds, list) and rounds:
+        recent_rounds = rounds[-2:]
+        attempts: list[dict[str, Any]] = []
+        for round_data in recent_rounds:
+            if not isinstance(round_data, dict):
+                continue
+            for execution in round_data.get("executions", []):
+                if not isinstance(execution, dict):
+                    continue
+                attempts.append(
+                    {
+                        "round": round_data.get("round"),
+                        "subquery_id": execution.get("subquery_id"),
+                        "query_description": shorten_for_history(execution.get("query_description", "")),
+                        "sparql": shorten_for_history(execution.get("sparql", "")),
+                        "result_summary": shorten_for_history(execution.get("result_summary", "")),
+                        "error": shorten_for_history(execution.get("error", "")),
+                    }
+                )
+        summary = history.get("accumulated_summary")
+        return (
+            "Previous GraphDB context in this same user request:\n"
+            f"Accumulated summary: {json.dumps(shorten_for_history(summary), ensure_ascii=False, indent=2)}\n"
+            f"Recent executions: {json.dumps(attempts[-8:], ensure_ascii=False, indent=2)}\n\n"
+            "Use this context directly: do not repeat failed query shapes. If exact predicates returned no rows, use a discovery query over non-rdf:type predicates with language-filtered labels.\n\n"
+        )
+
     steps = history.get("steps", [])
     if not isinstance(steps, list):
         return ""
@@ -213,8 +299,24 @@ def format_ontology_candidates_block(candidates: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def generate_sparql(user_prompt: str, query_description: str, history: dict[str, Any] | None = None) -> str:
-    ontology_candidates = ontology_retriever.retrieve_candidates(query_description)
+def generate_sparql(
+    user_prompt: str,
+    query_description: str,
+    history: dict[str, Any] | None = None,
+    *,
+    subquery_id: str | None = None,
+    round_context: dict[str, Any] | None = None,
+) -> str:
+    ontology_lookup_terms = generate_ontology_lookup_terms(
+        user_prompt,
+        query_description,
+        subquery_id=subquery_id,
+        round_context=round_context,
+    )
+    ontology_candidates = ontology_retriever.retrieve_candidates_for_terms(
+        ontology_lookup_terms,
+        source_query=query_description,
+    )
     previous_attempts_prompt = previous_attempts_block(history)
     ontology_candidates_block = format_ontology_candidates_block(ontology_candidates)
     resource_candidates_block = possible_resource_block(user_prompt, query_description)
@@ -227,8 +329,9 @@ def generate_sparql(user_prompt: str, query_description: str, history: dict[str,
         "Do not prefer a hand-written list such as parent/child/spouse/date/type/etc. over a retrieved candidate that semantically matches the request. "
         "A dbo: schema candidate can represent a class or a predicate; verify its role by using it in a focused query when its label fits the requested relation/attribute. "
         "Broad or generic predicate labels can still be valid in DBpedia; do not discard them only because they are not named like parent/spouse/date/etc. "
-        "A focused verification query should bind or use the candidate predicate and return distinct objects plus labels. "
-        "When predicate confidence is low, use a broad predicate scan from the correct subject and return predicate labels plus objects.\n\n"
+        "For non-count questions, a focused verification query should bind or use the candidate predicate and return distinct objects plus labels. "
+        "For count questions, bind or use the candidate predicate inside COUNT(DISTINCT ...) and return only the aggregate count. "
+        "When predicate confidence is low for non-count questions, use an anchored predicate scan from a known subject, VALUES subject list, or constrained rdf:type class and return predicate labels plus objects; for count questions, count distinct matching subjects or objects from the anchored pattern.\n\n"
         if ontology_candidates_block
         else ""
     )
@@ -238,16 +341,34 @@ def generate_sparql(user_prompt: str, query_description: str, history: dict[str,
         "Create one read-only SPARQL query from the central agent description.\n"
         "Only create SELECT or ASK. Do not use INSERT, DELETE, UPDATE, or SERVICE.\n"
         "After PREFIX declarations, the query must start with SELECT or ASK. Put VALUES blocks inside WHERE { ... }, never before SELECT/ASK.\n"
-        "Main priority for this phase: identify the correct subject and object resources. Predicate choice may be imperfect.\n"
+        "If Round context includes current_subquery_attempts, repair the newest failed SPARQL directly. Use the GraphDB error body as authoritative syntax feedback and do not repeat the same query.\n"
+        "VALUES syntax matters: separate values with whitespace only. Never use |, commas, or semicolons inside VALUES. Correct: VALUES ?p { dbo:port dbo:homePort dbo:location }. Wrong: VALUES ?p { dbo:port | dbo:homePort | dbo:location }. Use | only in property paths such as ?ship (dbo:port|dbo:homePort) ?location .\n"
+        "Query-cost safety rules, highest priority after read-only safety:\n"
+        "- Never generate unconstrained global triple scans such as ?s ?p ?o, ?x ?p ?y, ?subject ?predicate ?object, or SELECT DISTINCT ?p over the whole graph.\n"
+        "- Never UNION a full triple scan with schema label lookup, for example { ?s ?p ?o . } UNION { ?p rdfs:label ?pLabel . }.\n"
+        "- Never search all predicates with FILTER(CONTAINS(STR(?p), ...)) unless ?p is constrained by VALUES, a schema type, or a small candidate set.\n"
+        "- Predicate discovery must be anchored by at least one of: a known resource IRI/VALUES ?subject, a narrow rdf:type/rdfs:subClassOf* class constraint, a VALUES ?p candidate list, or schema-only property typing such as ?p a owl:ObjectProperty, ?p a owl:DatatypeProperty, or ?p a rdf:Property.\n"
+        "- If no safe anchor exists, return a schema-only property discovery query or {\"sparql\":\"\"}; do not scan data triples globally.\n"
+        "- Prefer ontology candidates and VALUES lists over CONTAINS scans. If using CONTAINS for property discovery, apply it only to schema/property resources, not to every data triple.\n"
+        "Highest-priority count rule: when the original prompt or central description asks 'how many', 'count', 'number of', 'bao nhiêu', 'mấy', or 'số lượng', the query must return one numeric scalar using COUNT(DISTINCT ...). Do not list matching rows first.\n"
+        "For count questions, even if the central description says 'find all', 'search for entities', 'discover entities', 'list URIs', or 'return labels', interpret that as defining the set to count, not as permission to SELECT the rows.\n"
+        "For count questions likely to match more than 100 rows, never use SELECT ?entity ... LIMIT 100/200 as the primary answer; use SELECT (COUNT(DISTINCT ?entity) AS ?count) WHERE { ... }.\n"
+        "Example for a count over scientists: SELECT (COUNT(DISTINCT ?scientist) AS ?count) WHERE { ?scientist rdf:type dbo:Scientist . }.\n"
+        "Main priority for non-count questions: identify the correct subject and object resources. Predicate choice may be imperfect.\n"
         "Prefer returning neutral factual evidence: entities, relationships, labels, dates, counts, and literal values needed by the core question.\n"
         "For entity lookup, prefer exact dbr:Entity_Name candidates from the question before label search. Preserve Vietnamese diacritics in dbr: IRIs and also try ASCII-folded alternatives when provided.\n"
         "If exact resources are plausible, use VALUES for them and then query their predicates directly; do not make rdfs:label matching the only way to find the entity.\n"
-        "If retrieved candidates include both a likely subject resource and a likely schema/property for the requested relation or attribute, first create a focused query using those candidates; use broad scans only after that is unsuitable.\n"
+        "If retrieved candidates include both a likely subject resource and a likely schema/property for the requested relation or attribute, first create a focused query using those candidates; use anchored scans only after that is unsuitable.\n"
         "For relationship or attribute questions, a retrieved property candidate whose label literally matches the requested concept is stronger evidence than generic property names you remember from DBpedia.\n"
-        "For count questions, return distinct candidate rows and labels instead of only COUNT, so the answer agent can verify what was counted.\n"
-        "When selecting resources, include labels/names when available using OPTIONAL rdfs:label or foaf:name. Do not require labels to exist.\n"
-        "When the correct predicate is uncertain, use a broad pattern like ?subject ?predicate ?object with OPTIONAL predicate/object labels, and return enough rows for the central/answer agents to choose or count distinct objects.\n"
-        "Avoid SELECT DISTINCT for broad label scans; use SELECT with LIMIT instead to keep GraphDB memory usage low.\n"
+        "For count questions such as 'how many', 'bao nhiêu', 'mấy', or 'số lượng', return an aggregate count query using COUNT(DISTINCT ?entity) AS ?count. Do not return candidate rows for the primary count. Do not add LIMIT to aggregate count queries that return one row.\n"
+        "If the requested count may involve more than 100 matching entities, use COUNT(DISTINCT ...) instead of SELECT rows with LIMIT 100; limited rows are samples, not totals.\n"
+        "If the original user prompt is a count question, this rule overrides central descriptions that say 'find all', 'list', or ask for URI rows; produce the numeric aggregate count first.\n"
+        "If a count question also needs verification, the central agent can ask for a separate sample query later; the first query should produce the numeric count.\n"
+        "When selecting resources for non-count questions, include labels/names when available using OPTIONAL rdfs:label or foaf:name. Do not require labels to exist.\n"
+        "When the correct predicate is uncertain for non-count questions, use an anchored pattern like VALUES ?subject { dbr:Known_Resource } ?subject ?predicate ?object, or ?subject rdf:type/rdfs:subClassOf* dbo:KnownClass . ?subject ?predicate ?object, with OPTIONAL predicate/object labels. For count questions with uncertain predicates, count distinct subjects or objects from an anchored pattern instead of returning rows.\n"
+        "For broad predicate discovery over an entity, filter out rdf:type unless type is the requested answer; prefer non-type predicates and language-filter labels to en, vi, or empty language.\n"
+        "If exact predicates such as deathPlace return no rows, try semantically adjacent DBpedia predicates such as restingPlace, placeOfBurial, location, subdivision, country, or other location hierarchy evidence when relevant.\n"
+        "Avoid SELECT DISTINCT for broad label scans; use SELECT with LIMIT 100 instead to keep GraphDB memory usage low.\n"
         "For fallback lookup, search across rdfs:label, foaf:name, and dbo:alias, and avoid strict language filters unless the variable is optional evidence only.\n"
         "Do not include answer choices, option IDs, VALUES blocks for choices, or BINDs mapping choices to options. The central agent handles choices later.\n"
         "SPARQL function syntax matters: use CONTAINS(LCASE(STR(?label)), \"text\"), never LCASE(STR(?label)) CONTAINS(\"text\"). Use || for logical OR; never use keyword OR inside FILTER expressions. If combining EXISTS with another boolean condition, put the whole expression inside one FILTER(...); never place || between graph patterns.\n\n"
@@ -265,6 +386,8 @@ def generate_sparql(user_prompt: str, query_description: str, history: dict[str,
         "Return only valid JSON with this schema: {\"sparql\":\"...\"}.\n"
         "If a useful query cannot be created, return {\"sparql\":\"\"}.\n\n"
         f"Original user prompt, for context only; do not extract answer options from it:\n{user_prompt}\n\n"
+        f"Subquery id: {subquery_id or ''}\n"
+        f"Round context:\n{json.dumps(shorten_for_history(round_context), ensure_ascii=False, indent=2) if round_context else '{}'}\n\n"
         f"Central agent query description:\n{query_description}"
     )
     raw_text = llm_service.complete_text(

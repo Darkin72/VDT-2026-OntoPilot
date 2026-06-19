@@ -15,10 +15,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import openpyxl
 import requests
@@ -51,6 +51,8 @@ class BenchmarkResult:
     has_db_evidence: bool
     valid_answer_count: int
     raw_response: str
+    response_json: dict[str, object]
+    trace_log: list[dict[str, Any]]
     error: str
     latency_seconds: float
 
@@ -217,6 +219,19 @@ def has_db_evidence(raw_response: str) -> bool:
         return False
     return bool(evidence_text.strip())
 
+def build_trace_step(step: str, detail: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "step": step,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "detail": detail,
+    }
+
+def extract_backend_trace(response_json: dict[str, object]) -> list[dict[str, Any]]:
+    trace = response_json.get("trace") or response_json.get("trace_log") or response_json.get("backend_trace")
+    if isinstance(trace, list):
+        return [item if isinstance(item, dict) else {"message": str(item)} for item in trace]
+    return []
+
 
 def run_single_case(
     index: int,
@@ -227,34 +242,112 @@ def run_single_case(
     echo_stream: bool,
 ) -> tuple[int, BenchmarkResult]:
     prompt = build_prompt(case)
+    trace_log: list[dict[str, Any]] = [
+        build_trace_step(
+            "benchmark.build_prompt",
+            {
+                "question_id": case.question_id,
+                "question_type": case.question_type,
+                "original_question": case.question,
+                "resource": case.resource,
+                "options": case.options,
+                "correct_answer": case.answer,
+                "prompt_sent_to_backend": prompt,
+            },
+        ),
+        build_trace_step(
+            "backend.request",
+            {
+                "method": "POST",
+                "url": backend_url,
+                "json": {"message": prompt},
+                "timeout_seconds": timeout,
+            },
+        ),
+    ]
     started_at = time.perf_counter()
     raw_response = ""
     error = ""
     predicted_answer: int | None = None
+    response_json: dict[str, object] = {}
 
     try:
         if echo_stream:
             print(f"    Model stream [{index}]: ", end="", flush=True)
         raw_response = call_backend(backend_url, prompt, timeout, echo_stream=echo_stream)
+        trace_log.append(
+            build_trace_step(
+                "backend.response_stream",
+                {
+                    "raw_response": raw_response,
+                    "response_chars": len(raw_response),
+                },
+            )
+        )
+        response_json = extract_response_json(raw_response)
+        trace_log.append(
+            build_trace_step(
+                "backend.response_json_extract",
+                {
+                    "parsed": bool(response_json),
+                    "response_json": response_json,
+                    "backend_trace_from_response": extract_backend_trace(response_json),
+                },
+            )
+        )
         predicted_answer = extract_answer(raw_response, len(case.options))
+        trace_log.append(
+            build_trace_step(
+                "benchmark.extract_answer",
+                {
+                    "predicted_answer": predicted_answer,
+                    "valid_answer_count": len(case.options),
+                },
+            )
+        )
     except Exception as exc:  # Ghi lỗi để benchmark tiếp tục chạy được.
         error = str(exc)
+        trace_log.append(
+            build_trace_step(
+                "backend.error",
+                {
+                    "type": type(exc).__name__,
+                    "message": error,
+                },
+            )
+        )
         if fail_fast:
             raise
     finally:
         latency = time.perf_counter() - started_at
 
     is_correct = predicted_answer == case.answer
+    evidence_found = has_db_evidence(raw_response)
+    trace_log.append(
+        build_trace_step(
+            "benchmark.score",
+            {
+                "correct_answer": case.answer,
+                "predicted_answer": predicted_answer,
+                "is_correct": is_correct,
+                "has_db_evidence": evidence_found,
+                "latency_seconds": round(latency, 4),
+                "error": error,
+            },
+        )
+    )
     return index, BenchmarkResult(
         question_id=case.question_id,
         question_type=case.question_type,
-        question=case.question,
+        question=prompt,
         correct_answer=case.answer,
         predicted_answer=predicted_answer,
         is_correct=is_correct,
-        has_db_evidence=has_db_evidence(raw_response),
+        has_db_evidence=evidence_found,
         valid_answer_count=len(case.options),
         raw_response=raw_response,
+        response_json=response_json,
+        trace_log=trace_log,
         error=error,
         latency_seconds=latency,
     )
@@ -394,8 +487,13 @@ def write_outputs(results: list[BenchmarkResult], summary: dict[str, object], ou
                 }
             )
 
+    report = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "summary": summary,
+        "results": [asdict(result) for result in results],
+    }
     with json_path.open("w", encoding="utf-8") as file:
-        json.dump(summary, file, ensure_ascii=False, indent=2)
+        json.dump(report, file, ensure_ascii=False, indent=2)
 
     return csv_path, json_path
 
@@ -408,7 +506,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offset", type=int, default=0, help="Bỏ qua N câu hỏi đầu tiên")
     parser.add_argument("--timeout", type=float, default=1200.0, help="Timeout đọc stream cho mỗi câu, tính bằng giây")
     parser.add_argument("--delay", type=float, default=0.0, help="Nghỉ giữa các request submit, tính bằng giây")
-    parser.add_argument("--concurrency", type=int, default=5, help="Số câu benchmark chạy song song")
+    parser.add_argument("--concurrency", type=int, default=1, help="Số câu benchmark chạy song song")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Thư mục ghi kết quả")
     parser.add_argument("--fail-fast", action="store_true", help="Dừng ngay khi request đầu tiên bị lỗi")
     parser.add_argument(
@@ -467,5 +565,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

@@ -171,8 +171,14 @@ def lookup_term(connection: sqlite3.Connection, term: str, *, limit: int) -> lis
     ).fetchall()
 
 
-def retrieve_candidates(query: str) -> list[dict[str, Any]]:
-    if not lookup_enabled() or not query.strip():
+def retrieve_candidates_for_terms(terms: list[str], *, source_query: str = "") -> list[dict[str, Any]]:
+    clean_terms: list[str] = []
+    for term in terms:
+        add_unique(clean_terms, str(term))
+        if len(clean_terms) >= max_query_terms():
+            break
+
+    if not lookup_enabled() or not clean_terms:
         return []
 
     db_path = lookup_db_path()
@@ -184,7 +190,6 @@ def retrieve_candidates(query: str) -> list[dict[str, Any]]:
         logging_service.agent_step("ontology_lookup.missing_documents", {"documents_path": str(source_path)}, limit=1000)
         return []
 
-    terms = generate_lookup_terms(query)
     candidates: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     matched_terms: list[str] = []
@@ -192,7 +197,7 @@ def retrieve_candidates(query: str) -> list[dict[str, Any]]:
         connection = sqlite3.connect(db_path)
         connection.row_factory = sqlite3.Row
         with source_path.open("rb") as handle:
-            for term in terms:
+            for term in clean_terms:
                 rows = lookup_term(connection, term, limit=per_query_limit())
                 if rows:
                     matched_terms.append(term)
@@ -219,7 +224,8 @@ def retrieve_candidates(query: str) -> list[dict[str, Any]]:
             "ontology_lookup.retrieved",
             {
                 "db_path": str(db_path),
-                "query_terms": terms,
+                "source_query": source_query,
+                "query_terms": clean_terms,
                 "matched_terms": matched_terms,
                 "candidate_count": len(candidates),
                 "candidates": [format_candidate(candidate) for candidate in candidates[:5]],
@@ -234,6 +240,11 @@ def retrieve_candidates(query: str) -> list[dict[str, Any]]:
             limit=2000,
         )
         return []
+
+def retrieve_candidates(query: str) -> list[dict[str, Any]]:
+    if not query.strip():
+        return []
+    return retrieve_candidates_for_terms(generate_lookup_terms(query), source_query=query)
 
 
 def format_candidate(candidate: dict[str, Any]) -> str:
