@@ -135,7 +135,9 @@ def query(sparql: str, *, timeout_seconds: int | None = None) -> dict[str, Any]:
                 "repository_url": repository_url,
                 "timeout_seconds": timeout_seconds,
                 "sparql_chars": len(compact_sparql),
+                "sparql": sparql,
             },
+            limit=12000,
         )
         try:
             response = requests.post(

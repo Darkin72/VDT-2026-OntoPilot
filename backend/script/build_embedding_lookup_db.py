@@ -150,7 +150,12 @@ def build(documents_path, db_path, batch_size, recreate, limit):
                     break
         if document_rows:
             insert_batch(conn, document_rows, term_rows)
-        conn.executescript('CREATE INDEX IF NOT EXISTS idx_documents_label ON documents(label); CREATE INDEX IF NOT EXISTS idx_documents_curie ON documents(curie);')
+        conn.executescript('''
+        CREATE INDEX IF NOT EXISTS idx_documents_label ON documents(label);
+        CREATE INDEX IF NOT EXISTS idx_documents_curie ON documents(curie);
+        CREATE INDEX IF NOT EXISTS idx_documents_kind ON documents(kind);
+        CREATE INDEX IF NOT EXISTS idx_documents_uri ON documents(uri);
+        ''')
         conn.commit()
         conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
         conn.execute('PRAGMA journal_mode = DELETE')

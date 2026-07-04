@@ -1,5 +1,6 @@
 import json
 import re
+import time
 import unicodedata
 from typing import Any
 
@@ -7,6 +8,93 @@ from app import llm_service, logging_service
 from app.agents.central import extract_json_object
 from app.agents.central.agent import shorten_for_history, strip_answer_options
 from app.rag import ontology_retriever
+
+import sqlite3
+from pathlib import Path
+from rdflib.plugins.sparql import prepareQuery
+from app.rag.ontology_retriever import fetch_document, lookup_db_path, documents_path
+
+def validate_sparql(query: str, context: str = "") -> str | None:
+    if not query.strip(): return None
+    # 1. Syntax check
+    try:
+        prepareQuery(query)
+    except Exception as e:
+        return f"SYNTAX_ERROR: {e}. Please fix your SPARQL syntax."
+    
+    # 2. Extract URIs
+    uris = set(re.findall(r'<http://dbpedia.org/resource/([^>]+)>', query))
+    curies = set(re.findall(r'(?<![\w:/#])dbr:([A-Za-z_][\w.-]*)', query))
+    uris.update(curies)
+    subject_uris = set(re.findall(r'VALUES\s+\?\w*subject\w*\s*\{[^}]*?dbr:([A-Za-z_][\w.-]*)', query, re.IGNORECASE))
+    subject_uris.update(re.findall(r'(?m)^\s*dbr:([A-Za-z_][\w.-]*)\s+\?\w+', query))
+    
+    if not uris: return None
+        
+    # 3. Check SQLite
+    db_path = lookup_db_path()
+    if not db_path.exists():
+        db_path = Path(__file__).resolve().parents[4] / "Ontology" / "normalized" / "embedding_lookup.sqlite"
+    source_path = documents_path()
+    if not source_path.exists():
+        source_path = Path(__file__).resolve().parents[4] / "Ontology" / "normalized" / "embedding_documents.jsonl"
+    if not db_path.exists(): return None
+    
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    missing = []
+    type_mismatch = []
+    normalized_context = unicodedata.normalize("NFKD", context)
+    normalized_context = "".join(ch for ch in normalized_context if not unicodedata.combining(ch)).casefold()
+    optional_label_vars = set(re.findall(r"OPTIONAL\s*\{[^{}]*rdfs:label\s+\?(\w+)[^{}]*\}\s*FILTER\s*\([^)]*LANG\s*\(\s*\?\1\s*\)", query, re.IGNORECASE | re.DOTALL))
+    if optional_label_vars:
+        return "OPTIONAL_LABEL_FILTER_OUTSIDE: A LANG filter for an OPTIONAL label variable is outside the OPTIONAL block, which drops rows when the label is absent. Move the LANG filter inside the OPTIONAL block or remove it."
+
+    leadership_context = any(term in normalized_context for term in ["rector", "president", "principal", "head", "leader", "hieu truong"])
+    if leadership_context and any(term in query for term in ["dbo:rector", "dbo:head"]):
+        missing_leadership_fallbacks = [term for term in ["dbo:president", "dbo:firstPopularVote", "sameSettingAs"] if term not in query]
+        if len(missing_leadership_fallbacks) >= 2:
+            return "LEADERSHIP_PREDICATE_INCOMPLETE: Educational-institution leadership queries must include broader DBpedia predicates such as dbo:president and non-standard fallback predicates like dbo:firstPopularVote or DUL sameSettingAs, because local DBpedia may not use dbo:rector/dbo:head. Return a corrected focused query."
+
+    expected_type_patterns = []
+    if any(term in normalized_context for term in ["aircraft carrier", "tau san bay", "ship", "tau", "vessel"]):
+        expected_type_patterns = ["ship", "aircraftcarrier", "meanoftransportation"]
+    elif any(term in normalized_context for term in ["aircraft", "may bay"]):
+        expected_type_patterns = ["aircraft", "meanoftransportation"]
+    elif any(term in normalized_context for term in ["city", "thanh pho"]):
+        expected_type_patterns = ["city", "settlement", "populatedplace"]
+    elif any(term in normalized_context for term in ["university", "truong dai hoc"]):
+        expected_type_patterns = ["university", "educationalinstitution"]
+    elif any(term in normalized_context for term in ["person", "nguoi"]):
+        expected_type_patterns = ["person"]
+
+    for uri in uris:
+        full_uri = f"http://dbpedia.org/resource/{uri}"
+        row = conn.execute("SELECT * FROM documents WHERE curie = ? LIMIT 1", (f"dbr:{uri}",)).fetchone()
+        if not row:
+            missing.append(uri)
+            continue
+        if uri in subject_uris and expected_type_patterns and source_path.exists():
+            with source_path.open("rb") as handle:
+                document = fetch_document(handle, int(row["byte_offset"]))
+            types_text = str(document.get("types_json") or document.get("types") or "").casefold()
+            if types_text and not any(pattern in types_text.replace("_", "") for pattern in expected_type_patterns):
+                type_mismatch.append((uri, types_text[:200]))
+    conn.close()
+    
+    if missing:
+        msg = f"ENTITY_NOT_FOUND: The following resources do not exist in the database: "
+        msg += ", ".join([f"dbr:{u}" for u in missing])
+        msg += ". Please rewrite the query using a valid resource or broad label search."
+        return msg
+    if type_mismatch:
+        msg = "SUBJECT_TYPE_MISMATCH: The query anchors the requested typed entity to incompatible resources: "
+        msg += ", ".join([f"dbr:{u} has types {t}" for u, t in type_mismatch])
+        msg += ". Use a more specific valid resource candidate or search by label with an rdf:type/rdfs:subClassOf* constraint matching the requested entity type. For aircraft carriers/naval vessels, use dbo:Ship rather than dbo:Aircraft."
+        return msg
+        
+    return None
+
 
 READ_ONLY_SPARQL_PATTERN = re.compile(
     r"\b(INSERT|DELETE|LOAD|CLEAR|CREATE|DROP|MOVE|COPY|ADD|SERVICE)\b",
@@ -64,7 +152,7 @@ PREFIX_USAGE_PATTERN = re.compile(r"(?<![\w:/#])([A-Za-z][\w-]*):[A-Za-z_][\w.-]
 PREFIX_LINE_PATTERN = re.compile(r"(?im)^\s*PREFIX\s+[^\n]+\n?")
 LEADING_VALUES_PATTERN = re.compile(r"(?is)^\s*((?:VALUES\s+\?\w+\s*\{[^{}]*\}\s*)+)((?:SELECT|ASK)\b.*)$")
 WORD_PATTERN = re.compile(r"[^\W\d_][\w.-]*", re.UNICODE)
-STOP_RESOURCE_PHRASES = {"GraphDB", "DBpedia", "SPARQL", "JSON"}
+STOP_RESOURCE_PHRASES = {"GraphDB", "DBpedia", "SPARQL", "JSON", "Entity", "Length", "Resource", "Question", "Answer"}
 OPERATIONAL_LOOKUP_TERM_PATTERN = re.compile(
     r"(?is)\b(sparql|query|count|count\s*distinct|total\s+number|single\s+integer|"
     r"aggregate|perform|execute|return|select|ask|where|limit|evidence)\b"
@@ -104,6 +192,16 @@ def move_leading_values_into_where(query: str) -> str:
     return f"{prefix_lines}{query_body[:where_start + 1]}\n{indented_values}{query_body[where_start + 1:]}"
 
 
+
+
+def expand_parenthesized_dbr_resources(query: str) -> str:
+    return re.sub(
+        r"(?<![\w:/#])dbr:([^\s{};,]+\([^\s{};,]+\)[^\s{};,]*)",
+        lambda match: f"<http://dbpedia.org/resource/{match.group(1)}>",
+        query,
+    )
+
+
 def normalize_filter_logical_or(query: str) -> str:
     return re.sub(r"(?i)(\s+)OR(\s+)", r"\1||\2", query)
 
@@ -137,9 +235,86 @@ def resource_iri_name(text: str) -> str:
     return re.sub(r"\s+", "_", text.strip())
 
 
+
+
+def _local_lookup_db_path() -> Path | None:
+    db_path = lookup_db_path()
+    if not db_path.exists():
+        db_path = Path(__file__).resolve().parents[4] / "Ontology" / "normalized" / "embedding_lookup.sqlite"
+    return db_path if db_path.exists() else None
+
+
+def _clean_resource_name(name: str) -> str:
+    prefixes = {"entity", "resource", "ship", "vessel", "aircraft", "carrier", "tau", "may", "bay", "san", "city"}
+    words = name.split()
+    while words and strip_diacritics(words[0]).casefold() in prefixes:
+        words.pop(0)
+    return " ".join(words).strip()
+
+
+def lookup_resource_candidates(names: list[str], context: str, *, limit: int = 8) -> list[str]:
+    db_path = _local_lookup_db_path()
+    if not db_path:
+        return []
+
+    normalized_context = unicodedata.normalize("NFKD", context)
+    normalized_context = "".join(ch for ch in normalized_context if not unicodedata.combining(ch)).casefold()
+    year_tokens = re.findall(r"\b(?:18|19|20)\d{2}\b", context)
+    candidates: list[str] = []
+
+    def add(curie: str) -> None:
+        if curie and curie.startswith("dbr:") and curie not in candidates:
+            candidates.append(curie)
+
+    query_names = []
+    for name in names:
+        for candidate in [name, _clean_resource_name(name), strip_diacritics(_clean_resource_name(name))]:
+            candidate = candidate.strip()
+            if candidate and candidate not in query_names:
+                query_names.append(candidate)
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    for name in query_names:
+        iri_name = resource_iri_name(name)
+        exact_curie = f"dbr:{iri_name}"
+        row = conn.execute("SELECT curie FROM documents WHERE curie = ? AND kind = 'entity' LIMIT 1", (exact_curie,)).fetchone()
+        if row:
+            add(str(row["curie"]))
+
+        rows = conn.execute(
+            """
+            SELECT d.curie, d.uri FROM terms t
+            JOIN documents d ON d.doc_id = t.doc_id
+            WHERE t.term = ? AND d.kind = 'entity'
+            ORDER BY d.line_number
+            LIMIT 20
+            """,
+            (ontology_retriever.normalize_term(name),),
+        ).fetchall()
+        sorted_rows = sorted(
+            rows,
+            key=lambda row: (
+                0 if any(year in str(row["uri"]) for year in year_tokens) else 1,
+                0 if "aircraft_carrier" in normalized_context and "aircraft_carrier" in str(row["uri"]).casefold() else 1,
+                len(str(row["uri"])),
+            ),
+        )
+        for row in sorted_rows[:3]:
+            add(str(row["curie"]))
+        if len(candidates) >= limit:
+            break
+    conn.close()
+    return candidates[:limit]
+
+
 def possible_resource_names(user_prompt: str, query_description: str) -> list[str]:
     text = f"{query_description}\n{strip_answer_options(user_prompt)}"
     names: list[str] = []
+    for match in re.findall(r"[A-Z][\w.-]*(?:\s+[A-Z][\w.-]*)+\s*\([^)]+\)", text):
+        cleaned = match.strip()
+        if cleaned and cleaned not in names:
+            names.append(cleaned)
     for segment in re.split(r"[\n\r\t,;:!?()\[\]{}]+", text):
         words = WORD_PATTERN.findall(segment)
         index = 0
@@ -173,11 +348,12 @@ def possible_resource_names(user_prompt: str, query_description: str) -> list[st
 
 def possible_resource_block(user_prompt: str, query_description: str) -> str:
     names = possible_resource_names(user_prompt, query_description)
-    if not names:
+    candidates = lookup_resource_candidates(names, f"{user_prompt}\n{query_description}")
+    if not candidates:
         return ""
 
-    lines = ["Possible DBpedia resource IRIs from the question:"]
-    lines.extend(f"- dbr:{resource_iri_name(name)}" for name in names)
+    lines = ["Verified DBpedia resource IRIs from local ontology lookup:"]
+    lines.extend(f"- {candidate}" for candidate in candidates)
     return "\n".join(lines)
 
 def generate_ontology_lookup_terms(
@@ -312,6 +488,7 @@ def generate_sparql(
     subquery_id: str | None = None,
     round_context: dict[str, Any] | None = None,
 ) -> str:
+    started = time.monotonic()
     ontology_lookup_terms = generate_ontology_lookup_terms(
         user_prompt,
         query_description,
@@ -321,6 +498,15 @@ def generate_sparql(
     ontology_candidates = ontology_retriever.retrieve_candidates_for_terms(
         ontology_lookup_terms,
         source_query=query_description,
+    )
+    logging_service.agent_step(
+        "sparql_agent.ontology_lookup_done",
+        {
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "candidate_count": len(ontology_candidates),
+            "candidates": [ontology_retriever.format_candidate(candidate) for candidate in ontology_candidates[:8]],
+        },
+        limit=4000,
     )
     previous_attempts_prompt = previous_attempts_block(history)
     ontology_candidates_block = format_ontology_candidates_block(ontology_candidates)
@@ -408,23 +594,51 @@ def generate_sparql(
         },
         limit=30000,
     )
-    raw_text = llm_service.complete_text(
-        [
-            llm_service.system_message("You are a SPARQL coder. Return only SPARQL JSON."),
-            llm_service.user_message(prompt),
-        ]
-    )
-    logging_service.trace_text("sparql_agent.raw_response", raw_text, limit=30000)
-    data: dict[str, Any] = extract_json_object(raw_text)
-    sparql = str(data.get("sparql", "")).strip() if data else ""
-    sparql = normalize_escaped_sparql_whitespace(sparql)
-    sparql = add_missing_common_prefixes(sparql)
-    sparql = move_leading_values_into_where(sparql)
-    sparql = normalize_filter_logical_or(sparql)
-    sparql = ensure_select_limit(sparql)
-    if not is_read_only_sparql(sparql):
-        logging_service.trace_step("sparql_agent.rejected_sparql", {"sparql": sparql})
-        return ""
-    logging_service.trace_text("sparql_agent.final_sparql", sparql)
+    
+    messages = [
+        llm_service.system_message("You are a SPARQL coder. Return only SPARQL JSON."),
+        llm_service.user_message(prompt),
+    ]
+    
+    for attempt in range(3):
+        attempt_started = time.monotonic()
+        logging_service.agent_step(
+            "sparql_agent.llm_generate_start",
+            {"attempt": attempt + 1, "message_chars": sum(len(message.get("content", "")) for message in messages)},
+            limit=1000,
+        )
+        raw_text = llm_service.complete_text(messages)
+        logging_service.trace_text(f'sparql_agent.raw_response_attempt_{attempt+1}', raw_text, limit=30000)
+        data = extract_json_object(raw_text)
+        sparql = str(data.get('sparql', '')).strip() if data else ''
+        if not sparql: return ''
+        sparql = normalize_escaped_sparql_whitespace(sparql)
+        sparql = add_missing_common_prefixes(sparql)
+        sparql = expand_parenthesized_dbr_resources(sparql)
+        sparql = move_leading_values_into_where(sparql)
+        sparql = normalize_filter_logical_or(sparql)
+        sparql = ensure_select_limit(sparql)
+        if not is_read_only_sparql(sparql):
+            logging_service.trace_step('sparql_agent.rejected_sparql', {'sparql': sparql})
+            return ''
+        validation_error = validate_sparql(sparql, context=user_prompt + "\n" + query_description)
+        logging_service.agent_step(
+            "sparql_agent.llm_generate_done",
+            {
+                "attempt": attempt + 1,
+                "elapsed_seconds": round(time.monotonic() - attempt_started, 3),
+                "sparql": sparql,
+                "validation": validation_error or "ok",
+            },
+            limit=8000,
+        )
+        if validation_error:
+            logging_service.agent_step('sparql_agent.validation_error', {'attempt': attempt+1, 'error': validation_error})
+            messages.append({"role": "assistant", "content": raw_text})
+            err_msg = 'Validation failed:\n' + validation_error + '\nReturn a corrected JSON object with {"sparql": "..."}.'
+            messages.append(llm_service.user_message(err_msg))
+            continue
+        logging_service.agent_text('sparql_agent.final_sparql', sparql, limit=12000)
+        return sparql
+    logging_service.agent_text('sparql_agent.validation_failed_max_attempts', sparql, limit=12000)
     return sparql
-

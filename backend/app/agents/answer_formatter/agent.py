@@ -20,6 +20,7 @@ def final_answer_messages(message: str, history: dict[str, Any]) -> list[llm_ser
             "Never choose an option because it is generally true, historically true, more plausible, likely, or supported by facts not present in the history. "
             "If GraphDB rows conflict with common knowledge, still choose the option supported by GraphDB. "
             "If an evidence row contains the exact value, date, count, label, URI local name, or ordered item matching one answer choice, choose that matching option even if another option seems more plausible outside GraphDB. "
+            "If an evidence row label/URI contains a title plus a qualifier such as manga, comic, film, adaptation, edition, version, or date, and one answer choice names the base title, treat it as supporting that base-title option unless the question explicitly excludes adaptations/versions. Do not reject a GraphDB-supported adaptation merely because it is not an original work. "
             "For boolean prompts, answer Yes/True only when GraphDB history explicitly supports the positive claim; answer No/False only when GraphDB history explicitly contradicts it. Do not infer from real-world knowledge. "
             "For comparison, ordering, and superlative prompts, use only numeric/date values returned by GraphDB history; if such values are missing, do not invent or import values from memory. "
             "Every evidence item should cite a concrete value, entity, relationship, date, count, or literal from the history when possible. "

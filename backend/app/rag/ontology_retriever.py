@@ -178,6 +178,9 @@ def retrieve_candidates_for_terms(terms: list[str], *, source_query: str = "") -
         if len(clean_terms) >= max_query_terms():
             break
 
+    term_order = {term: index for index, term in enumerate(clean_terms)}
+    clean_terms.sort(key=lambda term: (0 if normalize_term(term).startswith("dbr:") else 1, term_order[term]))
+
     if not lookup_enabled() or not clean_terms:
         return []
 
